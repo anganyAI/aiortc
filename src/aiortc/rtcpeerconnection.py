@@ -303,6 +303,9 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         self.__remoteIce: dict[
             Union[RTCRtpTransceiver, RTCSctpTransport], RTCIceParameters
         ] = {}
+        self.__remoteIceCandidates: dict[
+            Union[RTCRtpTransceiver, RTCSctpTransport], list[RTCIceCandidate]
+        ] = {}
         self.__seenMids: set[str] = set()
         self.__sctp: Optional[RTCSctpTransport] = None
         self.__sctp_mline_index: Optional[int] = None
@@ -960,6 +963,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 dtlsTransport = transceiver.receiver.transport
                 self.__remoteDtls[transceiver] = media.dtls
                 self.__remoteIce[transceiver] = media.ice
+                self.__remoteIceCandidates[transceiver] = media.ice_candidates
 
             elif media.kind == "application":
                 if not self.__sctp:
@@ -981,11 +985,21 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 dtlsTransport = self.__sctp.transport
                 self.__remoteDtls[self.__sctp] = media.dtls
                 self.__remoteIce[self.__sctp] = media.ice
+                self.__remoteIceCandidates[self.__sctp] = media.ice_candidates
 
             if dtlsTransport is not None:
                 # add ICE candidates
                 iceTransport = dtlsTransport.transport
                 iceCandidates[iceTransport] = media
+
+                # detect ICE restart (credentials changed) and allow
+                # new remote candidates to be added
+                if (
+                    media.ice.usernameFragment
+                    != iceTransport._connection.remote_username
+                    or media.ice.password != iceTransport._connection.remote_password
+                ) and iceTransport.iceGatherer._remote_candidates_end:
+                    iceTransport.iceGatherer._remote_candidates_end = False
 
                 # set ICE role
                 if description.type == "offer" and not iceTransport._role_set:
@@ -1077,8 +1091,16 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 iceTransport.iceGatherer.getLocalCandidates()
                 and transceiver in self.__remoteIce
             ):
-                await iceTransport.start(self.__remoteIce[transceiver])
-                if dtlsTransport.state == "new":
+                await iceTransport.start(
+                    self.__remoteIce[transceiver],
+                    remoteCandidates=self.__remoteIceCandidates.get(transceiver),
+                )
+                if getattr(iceTransport, "_ice_restarted", False):
+                    # ICE restart: clear flag but do NOT restart DTLS.
+                    # Teams (and many servers) reuse the existing DTLS session
+                    # and SRTP keys over the new ICE pair.
+                    iceTransport._ice_restarted = False
+                elif dtlsTransport.state == "new":
                     await dtlsTransport.start(self.__remoteDtls[transceiver])
                 if dtlsTransport.state == "connected":
                     if transceiver.currentDirection in ["sendonly", "sendrecv"]:
@@ -1094,8 +1116,13 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 iceTransport.iceGatherer.getLocalCandidates()
                 and self.__sctp in self.__remoteIce
             ):
-                await iceTransport.start(self.__remoteIce[self.__sctp])
-                if dtlsTransport.state == "new":
+                await iceTransport.start(
+                    self.__remoteIce[self.__sctp],
+                    remoteCandidates=self.__remoteIceCandidates.get(self.__sctp),
+                )
+                if getattr(iceTransport, "_ice_restarted", False):
+                    iceTransport._ice_restarted = False
+                elif dtlsTransport.state == "new":
                     await dtlsTransport.start(self.__remoteDtls[self.__sctp])
                 if dtlsTransport.state == "connected":
                     await self.__sctp.start(
@@ -1130,9 +1157,13 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 iceServers=self.__configuration.iceServers,
                 local_username=parameters.usernameFragment,
                 local_password=parameters.password,
+                iceTransportPolicy=self.__configuration.iceTransportPolicy,
             )
         else:
-            iceGatherer = RTCIceGatherer(iceServers=self.__configuration.iceServers)
+            iceGatherer = RTCIceGatherer(
+                iceServers=self.__configuration.iceServers,
+                iceTransportPolicy=self.__configuration.iceTransportPolicy,
+            )
 
         iceGatherer.on("statechange", self.__updateIceGatheringState)
         iceTransport = RTCIceTransport(iceGatherer)

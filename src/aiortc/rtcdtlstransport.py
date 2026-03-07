@@ -545,6 +545,42 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._set_state(State.CONNECTED)
         self._task = asyncio.ensure_future(self.__run())
 
+    async def restart(self, remoteParameters: RTCDtlsParameters) -> None:
+        """
+        Restart DTLS handshake with new remote parameters.
+
+        Discards the old SSL session without sending ``close_notify``
+        (to avoid tearing down the remote side) and performs a fresh
+        handshake.
+
+        :param remoteParameters: An :class:`RTCDtlsParameters`.
+        """
+        # Stop the data pump without sending close_notify.
+        # Pre-set _state to CLOSED so that __run's finally block
+        # (which also sets CLOSED) becomes a no-op and does NOT
+        # emit a statechange event — that would trigger the
+        # PeerConnection's auto-shutdown logic.
+        if self._task is not None:
+            self._state = State.CLOSED
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+        # Discard old SSL and SRTP state
+        self._ssl = None
+        self._rx_srtp = None
+        self._tx_srtp = None
+        self.encrypted = False
+
+        # Reset state so start() can run again
+        self._set_state(State.NEW)
+
+        # Run a fresh DTLS handshake
+        await self.start(remoteParameters)
+
     async def stop(self) -> None:
         """
         Stop and close the DTLS transport.
@@ -743,6 +779,9 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         except SSL.Error:
             data = b""
         if data:
+            self.__log_debug(
+                "DTLS sending %d bytes (first_byte=0x%02x)", len(data), data[0]
+            )
             await self.transport._send(data)
             self.__tx_bytes += len(data)
             self.__tx_packets += 1

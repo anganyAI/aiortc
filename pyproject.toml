@@ -78,3 +78,6 @@ version = {attr = "aiortc.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.uv.sources]
+aioice = { path = "../aioice", editable = true }

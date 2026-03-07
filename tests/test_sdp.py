@@ -506,7 +506,7 @@ a=ssrc:2690029308 label:lyNSTe6w2ijnMrDEiqTHFyhqjdAag3ysa0"""
         self.assertEqual(d.media[0].host, None)
         self.assertEqual(d.media[0].port, 16628)
         self.assertEqual(d.media[0].profile, "UDP/TLS/RTP/SAVPF")
-        self.assertEqual(d.media[0].direction, None)
+        self.assertEqual(d.media[0].direction, "sendrecv")
         self.assertEqual(
             d.media[0].rtp.codecs,
             [
@@ -574,6 +574,7 @@ c=IN IP4 1.2.3.4
 t=0 0
 a=msid-semantic:WMS lyNSTe6w2ijnMrDEiqTHFyhqjdAag3ys
 m=audio 16628 UDP/TLS/RTP/SAVPF 8 101
+a=sendrecv
 a=rtcp:16628 IN IP4 1.2.3.4
 a=rtcp-mux
 a=ssrc:2690029308 cname:rbaag6w9fGmRXQm6
@@ -638,7 +639,7 @@ a=ssrc:2690029308 label:lyNSTe6w2ijnMrDEiqTHFyhqjdAag3ysa0"""
         self.assertEqual(d.media[0].host, None)
         self.assertEqual(d.media[0].port, 16628)
         self.assertEqual(d.media[0].profile, "UDP/TLS/RTP/SAVPF")
-        self.assertEqual(d.media[0].direction, None)
+        self.assertEqual(d.media[0].direction, "sendrecv")
         self.assertEqual(
             d.media[0].rtp.codecs,
             [
@@ -700,6 +701,7 @@ c=IN IP4 1.2.3.4
 t=0 0
 a=msid-semantic:WMS lyNSTe6w2ijnMrDEiqTHFyhqjdAag3ys
 m=audio 16628 UDP/TLS/RTP/SAVPF 8 101
+a=sendrecv
 a=rtcp:16628 IN IP4 1.2.3.4
 a=rtcp-mux
 a=ssrc:2690029308 cname:rbaag6w9fGmRXQm6
