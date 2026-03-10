@@ -329,6 +329,11 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         self.__pendingLocalDescription: Optional[sdp.SessionDescription] = None
         self.__pendingRemoteDescription: Optional[sdp.SessionDescription] = None
 
+        # When True, setLocalDescription() gathers candidates but does NOT
+        # start ICE/DTLS.  Call startTransports() manually after signaling
+        # is complete (e.g. after sending the SDP answer to the remote).
+        self._deferConnect = False
+
     @property
     def connectionState(self) -> str:
         """
@@ -867,8 +872,9 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             elif media.kind == "application":
                 add_transport_description(media, self.__sctp.transport)
 
-        # connect
-        asyncio.ensure_future(self.__connect())
+        # connect (unless deferred — caller will call startTransports())
+        if not self._deferConnect:
+            asyncio.ensure_future(self.__connect())
 
         # replace description
         if description.type == "answer":
@@ -876,6 +882,16 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             self.__pendingLocalDescription = None
         else:
             self.__pendingLocalDescription = description
+
+    async def startTransports(self) -> None:
+        """Start ICE and DTLS transports.
+
+        Call this after sending the SDP answer to the remote peer when
+        ``_deferConnect`` is True.  This ensures the DTLS ClientHello
+        is not sent before the remote has our SDP (which would cause
+        the remote to drop the handshake).
+        """
+        await self.__connect()
 
     async def setRemoteDescription(
         self, sessionDescription: RTCSessionDescription
@@ -1007,8 +1023,16 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                     iceTransport._role_set = True
 
                 # set DTLS role
-                if description.type == "offer" and media.dtls.role == "client":
-                    dtlsTransport._set_role(role="server")
+                if description.type == "offer":
+                    if media.dtls.role == "client":
+                        dtlsTransport._set_role(role="server")
+                    elif media.dtls.role in ("server", "auto"):
+                        # Offer says passive or actpass → we are active (client).
+                        # Must set now to prevent __connect() race: if the
+                        # background __connect() fires before setLocalDescription
+                        # sets the role from the answer SDP, the DTLS role would
+                        # resolve via ICE controlling → wrong direction.
+                        dtlsTransport._set_role(role="client")
                 if description.type == "answer":
                     dtlsTransport._set_role(
                         role="server" if media.dtls.role == "client" else "client"
@@ -1067,8 +1091,9 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         for event in trackEvents:
             self.emit("track", event.track)
 
-        # connect
-        asyncio.ensure_future(self.__connect())
+        # connect (unless deferred)
+        if not self._deferConnect:
+            asyncio.ensure_future(self.__connect())
 
         # update signaling state
         if description.type == "offer":
@@ -1087,15 +1112,23 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         for transceiver in self.__transceivers:
             dtlsTransport = transceiver.receiver.transport
             iceTransport = dtlsTransport.transport
-            if (
-                iceTransport.iceGatherer.getLocalCandidates()
-                and transceiver in self.__remoteIce
-            ):
+            has_candidates = bool(iceTransport.iceGatherer.getLocalCandidates())
+            has_remote = transceiver in self.__remoteIce
+            logger.info(
+                "__connect: candidates=%s, remote_ice=%s, dtls_state=%s, dtls_role=%s",
+                has_candidates, has_remote, dtlsTransport.state, dtlsTransport._role,
+            )
+            if has_candidates and has_remote:
                 await iceTransport.start(
                     self.__remoteIce[transceiver],
                     remoteCandidates=self.__remoteIceCandidates.get(transceiver),
                 )
-                if getattr(iceTransport, "_ice_restarted", False):
+                ice_restarted = getattr(iceTransport, "_ice_restarted", False)
+                logger.info(
+                    "__connect: ice done, ice_restarted=%s, dtls_state=%s",
+                    ice_restarted, dtlsTransport.state,
+                )
+                if ice_restarted:
                     # ICE restart: clear flag but do NOT restart DTLS.
                     # Teams (and many servers) reuse the existing DTLS session
                     # and SRTP keys over the new ICE pair.

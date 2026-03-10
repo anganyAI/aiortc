@@ -326,6 +326,20 @@ class RTCIceTransport(AsyncIOEventEmitter):
         """
         return [candidate_from_aioice(x) for x in self._connection.remote_candidates]
 
+    def updateRemoteCredentials(self, ufrag: str, pwd: str) -> None:
+        """
+        Update the remote ICE credentials without triggering an ICE restart.
+
+        This is needed when the remote peer sends new credentials via
+        signaling (e.g. media renegotiation) but the existing transport
+        should stay alive.  Without this, consent freshness checks
+        (RFC 7675) would fail because they use the old credentials.
+
+        :param ufrag: The new remote username fragment.
+        :param pwd: The new remote password.
+        """
+        self._connection.update_remote_credentials(ufrag, pwd)
+
     async def start(
         self,
         remoteParameters: RTCIceParameters,
