@@ -513,6 +513,12 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             else:
                 self._set_role("client")
 
+        logger.info(
+            "RTCDtlsTransport(%s) DTLS start: role=%s, ice_state=%s, fingerprints=%d",
+            id(self), self._role, self.transport.state,
+            len(remoteParameters.fingerprints),
+        )
+
         # Initialise SSL.
         self._ssl = SSL.Connection(
             self.__local_certificate._create_ssl_context(
@@ -544,6 +550,97 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self.__log_debug("- DTLS handshake complete")
         self._set_state(State.CONNECTED)
         self._task = asyncio.ensure_future(self.__run())
+
+    async def prepare_restart(self) -> None:
+        """
+        Stop the data pump and discard DTLS/SRTP state in preparation
+        for an ICE restart followed by :meth:`start`.
+
+        This must be called **before** the ICE transport is restarted,
+        otherwise the data pump may receive a ``ConnectionError`` from
+        the disrupted ICE connection and set the state to ``CLOSED``,
+        which triggers the PeerConnection's auto-shutdown logic.
+
+        Typical usage::
+
+            await dtls_transport.prepare_restart()
+            await ice_transport.start(new_ice_params, new_candidates)
+            await dtls_transport.start(new_dtls_params)
+        """
+        await self._stop_data_pump()
+
+        # Discard old SSL and SRTP state
+        self._ssl = None
+        self._rx_srtp = None
+        self._tx_srtp = None
+        self.encrypted = False
+
+        # Reset state so start() can run again
+        self._set_state(State.NEW)
+
+    async def suspend(self) -> None:
+        """
+        Stop the data pump while preserving DTLS/SRTP state.
+
+        Use this instead of :meth:`prepare_restart` when the remote side
+        will NOT perform a new DTLS handshake (e.g., media renegotiation
+        where the server reuses the existing DTLS session keys across an
+        ICE restart).
+
+        After the ICE transport is restarted, call :meth:`resume` to
+        restart the data pump with the existing SRTP keys.
+
+        Typical usage::
+
+            await dtls_transport.suspend()
+            await ice_transport.start(new_ice_params, new_candidates)
+            dtls_transport.resume()
+        """
+        await self._stop_data_pump()
+        # Restore CONNECTED state without emitting — SRTP keys are still valid
+        self._state = State.CONNECTED
+
+    def resume(self) -> None:
+        """
+        Restart the data pump with existing DTLS/SRTP state after
+        :meth:`suspend`.
+        """
+        assert self._state == State.CONNECTED
+        assert self.encrypted and self._ssl is not None
+        self._task = asyncio.ensure_future(self.__run())
+
+    async def _stop_data_pump(self) -> None:
+        """
+        Cancel the data pump task without triggering PeerConnection
+        auto-shutdown.
+        """
+        if self._task is not None:
+            # Pre-set _state to CLOSED so that __run's finally block
+            # (which also sets CLOSED) becomes a no-op and does NOT
+            # emit a statechange event — that would trigger the
+            # PeerConnection's auto-shutdown logic.
+            self._state = State.CLOSED
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def restart(self, remoteParameters: RTCDtlsParameters) -> None:
+        """
+        Restart DTLS handshake with new remote parameters.
+
+        Discards the old SSL session without sending ``close_notify``
+        (to avoid tearing down the remote side) and performs a fresh
+        handshake.
+
+        :param remoteParameters: An :class:`RTCDtlsParameters`.
+        """
+        await self.prepare_restart()
+
+        # Run a fresh DTLS handshake
+        await self.start(remoteParameters)
 
     async def stop(self) -> None:
         """
@@ -743,6 +840,10 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         except SSL.Error:
             data = b""
         if data:
+            logger.info(
+                "RTCDtlsTransport(%s) DTLS sending %d bytes (first_byte=0x%02x)",
+                self._role, len(data), data[0],
+            )
             await self.transport._send(data)
             self.__tx_bytes += len(data)
             self.__tx_packets += 1

@@ -456,7 +456,7 @@ class RtcpRrPacket:
 
     @classmethod
     def parse(cls, data: bytes, count: int) -> "RtcpRrPacket":
-        if len(data) != 4 + 24 * count:
+        if len(data) < 4 + 24 * count:
             raise ValueError("RTCP receiver report length is invalid")
 
         ssrc = unpack("!L", data[0:4])[0]
@@ -570,7 +570,7 @@ class RtcpSrPacket:
 
     @classmethod
     def parse(cls, data: bytes, count: int) -> "RtcpSrPacket":
-        if len(data) != 24 + 24 * count:
+        if len(data) < 24 + 24 * count:
             raise ValueError("RTCP sender report length is invalid")
 
         ssrc = unpack_from("!L", data)[0]

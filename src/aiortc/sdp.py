@@ -540,7 +540,18 @@ class SessionDescription:
                             setattr(ssrc_info, ssrc_attr, ssrc_value)
 
             if current_media.dtls.role is None:
-                current_media.dtls = None
+                if current_media.dtls.fingerprints:
+                    # Default to actpass per RFC 4145
+                    current_media.dtls.role = "auto"
+                else:
+                    current_media.dtls = None
+
+            # Default direction to sendrecv per RFC 4566
+            if current_media.direction is None and current_media.kind in [
+                "audio",
+                "video",
+            ]:
+                current_media.direction = "sendrecv"
 
             # requires codecs to have been parsed
             for line in media_lines[1:]:

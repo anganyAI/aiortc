@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from aioice import Candidate, Connection, ConnectionClosed
+from aioice.ice import TransportPolicy
 from pyee.asyncio import AsyncIOEventEmitter
 
 from .exceptions import InvalidStateError
@@ -186,6 +187,7 @@ class RTCIceGatherer(AsyncIOEventEmitter):
         iceServers: Optional[list[RTCIceServer]] = None,
         local_username: Optional[str] = None,
         local_password: Optional[str] = None,
+        iceTransportPolicy: str = "all",
     ) -> None:
         super().__init__()
 
@@ -193,10 +195,16 @@ class RTCIceGatherer(AsyncIOEventEmitter):
             iceServers = self.getDefaultIceServers()
         ice_kwargs = connection_kwargs(iceServers)
 
+        if iceTransportPolicy == "relay":
+            transport_policy = TransportPolicy.RELAY
+        else:
+            transport_policy = TransportPolicy.ALL
+
         self._connection = Connection(
             ice_controlling=False,
             local_username=local_username,
             local_password=local_password,
+            transport_policy=transport_policy,
             **ice_kwargs,
         )
         self._remote_candidates_end = False
@@ -318,20 +326,84 @@ class RTCIceTransport(AsyncIOEventEmitter):
         """
         return [candidate_from_aioice(x) for x in self._connection.remote_candidates]
 
-    async def start(self, remoteParameters: RTCIceParameters) -> None:
+    def updateRemoteCredentials(self, ufrag: str, pwd: str) -> None:
+        """
+        Update the remote ICE credentials without triggering an ICE restart.
+
+        This is needed when the remote peer sends new credentials via
+        signaling (e.g. media renegotiation) but the existing transport
+        should stay alive.  Without this, consent freshness checks
+        (RFC 7675) would fail because they use the old credentials.
+
+        :param ufrag: The new remote username fragment.
+        :param pwd: The new remote password.
+        """
+        self._connection.update_remote_credentials(ufrag, pwd)
+
+    async def start(
+        self,
+        remoteParameters: RTCIceParameters,
+        remoteCandidates: Optional[list[RTCIceCandidate]] = None,
+    ) -> None:
         """
         Initiate connectivity checks.
 
         :param remoteParameters: The :class:`RTCIceParameters` associated with
                                   the remote :class:`RTCIceTransport`.
+        :param remoteCandidates: Remote candidates to add after an ICE restart.
         """
         if self.state == "closed":
             raise InvalidStateError("RTCIceTransport is closed")
 
-        # handle the case where start is already in progress
+        # handle the case where start is already in progress or completed
         if self.__start is not None:
-            await self.__start.wait()
-            return
+            # Check for ICE restart (credentials changed)
+            if (
+                remoteParameters.usernameFragment != self._connection.remote_username
+                or remoteParameters.password != self._connection.remote_password
+            ):
+                self._ice_restarted = True
+                await self.__start.wait()
+
+                # Reset the gatherer's remote candidates flag
+                self.__iceGatherer._remote_candidates_end = False
+
+                # Use aioice's restart method (clears old state + candidates)
+                self._connection.restart(
+                    remoteParameters.usernameFragment,
+                    remoteParameters.password,
+                )
+                self._connection.remote_is_lite = remoteParameters.iceLite
+
+                # Re-add remote candidates after restart
+                if remoteCandidates:
+                    for candidate in remoteCandidates:
+                        await self._connection.add_remote_candidate(
+                            candidate_to_aioice(candidate)
+                        )
+                    await self._connection.add_remote_candidate(None)
+                    self.__iceGatherer._remote_candidates_end = True
+
+                # Restart monitor if it exited
+                if self.__monitor_task is None or self.__monitor_task.done():
+                    self.__monitor_task = asyncio.ensure_future(self._monitor())
+
+                # Run new connectivity checks
+                self.__start = asyncio.Event()
+                self.__setState("checking")
+                try:
+                    await self._connection.connect()
+                except ConnectionError:
+                    self.__setState("failed")
+                else:
+                    self.__setState("completed")
+                self.__start.set()
+                return
+            else:
+                await self.__start.wait()
+                return
+
+        self._ice_restarted = False
         self.__start = asyncio.Event()
         self.__monitor_task = asyncio.ensure_future(self._monitor())
 

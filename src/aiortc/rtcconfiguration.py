@@ -67,3 +67,6 @@ class RTCConfiguration:
 
     alwaysNegotiateDataChannels: bool = False
     "Whether to always negotiate data channels in the SDP."
+
+    iceTransportPolicy: str = "all"
+    "ICE transport policy: ``'all'`` or ``'relay'`` (TURN only)."

@@ -296,12 +296,24 @@ class RTCRtpReceiver:
         self.__remote_streams: dict[int, StreamStatistics] = {}
         self.__rtcp_ssrc: Optional[int] = None
 
+        # Contributing sources (CSRC) from mixed audio
+        self._csrc: list[int] = []
+
         # logging
         self.__log_debug: Callable[..., None] = lambda *args: None
         if logger.isEnabledFor(logging.DEBUG):
             self.__log_debug = lambda msg, *args: logger.debug(
                 f"RTCRtpReceiver(%s) {msg}", self.__kind, *args
             )
+
+    @property
+    def csrc(self) -> list[int]:
+        """
+        The Contributing Source identifiers (CSRC) from the most recent
+        RTP packet.  In a server-mixed audio stream, these identify which
+        participants' audio is included in the mix.
+        """
+        return list(self._csrc)
 
     @property
     def track(self) -> MediaStreamTrack:
@@ -453,6 +465,9 @@ class RTCRtpReceiver:
         Handle an incoming RTP packet.
         """
         self.__log_debug("< %s", packet)
+
+        # Track contributing sources (CSRC) for speaker identification
+        self._csrc = packet.csrc
 
         # If the receiver is disabled, discard the packet.
         if not self._enabled:
