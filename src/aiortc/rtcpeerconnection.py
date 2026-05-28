@@ -1109,6 +1109,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             self.__pendingRemoteDescription = description
 
     async def __connect(self) -> None:
+        started_transports: set[int] = set()
         for transceiver in self.__transceivers:
             dtlsTransport = transceiver.receiver.transport
             iceTransport = dtlsTransport.transport
@@ -1119,22 +1120,31 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 has_candidates, has_remote, dtlsTransport.state, dtlsTransport._role,
             )
             if has_candidates and has_remote:
-                await iceTransport.start(
-                    self.__remoteIce[transceiver],
-                    remoteCandidates=self.__remoteIceCandidates.get(transceiver),
-                )
-                ice_restarted = getattr(iceTransport, "_ice_restarted", False)
-                logger.info(
-                    "__connect: ice done, ice_restarted=%s, dtls_state=%s",
-                    ice_restarted, dtlsTransport.state,
-                )
-                if ice_restarted:
-                    # ICE restart: clear flag but do NOT restart DTLS.
-                    # Teams (and many servers) reuse the existing DTLS session
-                    # and SRTP keys over the new ICE pair.
-                    iceTransport._ice_restarted = False
-                elif dtlsTransport.state == "new":
-                    await dtlsTransport.start(self.__remoteDtls[transceiver])
+                # Bundled transceivers share one ICE/DTLS transport. Start it
+                # only once: the remote offer may carry per-m-line ICE
+                # credentials (Teams gives audio and video different
+                # ufrag/pwd), and calling start() again with another section's
+                # credentials triggers a spurious ICE restart that tears down
+                # the just-connected transport. The RTP setup below still runs
+                # per transceiver so each bundled stream is wired up.
+                if id(iceTransport) not in started_transports:
+                    started_transports.add(id(iceTransport))
+                    await iceTransport.start(
+                        self.__remoteIce[transceiver],
+                        remoteCandidates=self.__remoteIceCandidates.get(transceiver),
+                    )
+                    ice_restarted = getattr(iceTransport, "_ice_restarted", False)
+                    logger.info(
+                        "__connect: ice done, ice_restarted=%s, dtls_state=%s",
+                        ice_restarted, dtlsTransport.state,
+                    )
+                    if ice_restarted:
+                        # ICE restart: clear flag but do NOT restart DTLS.
+                        # Teams (and many servers) reuse the existing DTLS
+                        # session and SRTP keys over the new ICE pair.
+                        iceTransport._ice_restarted = False
+                    elif dtlsTransport.state == "new":
+                        await dtlsTransport.start(self.__remoteDtls[transceiver])
                 if dtlsTransport.state == "connected":
                     if transceiver.currentDirection in ["sendonly", "sendrecv"]:
                         await transceiver.sender.send(self.__localRtp(transceiver))
