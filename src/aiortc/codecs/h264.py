@@ -22,7 +22,11 @@ MIN_BITRATE = 500000  # 500 kbps
 MAX_BITRATE = 3000000  # 3 Mbps
 
 MAX_FRAME_RATE = 30
-PACKET_MAX = 1300
+# Largest RTP payload. Media servers forward packets with their own, larger
+# header extensions: Microsoft Teams silently drops forwarded 1300-byte
+# payloads, and their retransmissions too, so every large frame lost a packet
+# and the picture froze. Chrome keeps whole RTP packets under 1200 bytes.
+PACKET_MAX = 1100
 
 NAL_TYPE_FU_A = 28
 NAL_TYPE_STAP_A = 24

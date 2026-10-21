@@ -4,7 +4,12 @@ from contextlib import redirect_stderr
 from unittest import TestCase
 
 from aiortc.codecs import get_decoder, get_encoder
-from aiortc.codecs.h264 import H264Decoder, H264Encoder, H264PayloadDescriptor
+from aiortc.codecs.h264 import (
+    PACKET_MAX,
+    H264Decoder,
+    H264Encoder,
+    H264PayloadDescriptor,
+)
 from aiortc.jitterbuffer import JitterFrame
 from aiortc.rtcrtpparameters import RTCRtpCodecParameters
 
@@ -207,9 +212,18 @@ class H264Test(CodecTestCase):
         packetize_packages = H264Encoder._packetize(packages)
         self.assertListEqual(packages, packetize_packages)
 
-        packages = [bytes([0xFF]) * 1300]
+        packages = [bytes([0xFF]) * PACKET_MAX]
         packetize_packages = H264Encoder._packetize(packages)
         self.assertListEqual(packages, packetize_packages)
+
+    def test_packetize_fits_forwarding_servers(self) -> None:
+        # a media server adds its own header extensions when it forwards a
+        # packet: Teams drops 1300-byte payloads, Chrome stays under 1200
+        packages = [bytes([0x65]) + bytes([0xFF] * 10000)]
+        packetize_packages = H264Encoder._packetize(packages)
+        self.assertEqual(len(packetize_packages), 10)
+        for packet in packetize_packages:
+            self.assertLessEqual(len(packet), 1100)
 
     def test_packetize_one_big(self) -> None:
         packages = [bytes([0xFF, 0xFF] * 1000)]
