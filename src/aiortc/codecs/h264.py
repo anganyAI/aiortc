@@ -249,15 +249,28 @@ class H264Encoder(Encoder):
 
         return packetized_packages
 
+    def _bitrate_needs_new_codec(self) -> bool:
+        """
+        Tell whether the target bitrate moved far enough to recreate the codec.
+
+        The bitrate of an open libx264 codec does not change, and a new codec
+        starts with a keyframe. A lower target is followed past 10%, as the
+        receiver asked for less; a higher one only past 30%, so a receiver
+        raising its estimate in small steps does not get a keyframe each time.
+        """
+        assert self.codec is not None
+        current = self.codec.bit_rate
+        if self.target_bitrate < current:
+            return (current - self.target_bitrate) / current > 0.1
+        return (self.target_bitrate - current) / current > 0.3
+
     def _encode_frame(
         self, frame: av.VideoFrame, force_keyframe: bool
     ) -> Iterator[bytes]:
         if self.codec and (
             frame.width != self.codec.width
             or frame.height != self.codec.height
-            # we only adjust bitrate if it changes by over 10%
-            or abs(self.target_bitrate - self.codec.bit_rate) / self.codec.bit_rate
-            > 0.1
+            or self._bitrate_needs_new_codec()
         ):
             self.buffer_data = b""
             self.buffer_pts = None

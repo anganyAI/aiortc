@@ -250,6 +250,25 @@ class H264Test(CodecTestCase):
         self.assertEqual(packetize_packages[0][0] & 0x1F, 24)
         self.assertEqual(packetize_packages[1], packages[-1])
 
+    def test_encoder_bitrate_keyframes(self) -> None:
+        encoder = self.ensureIsInstance(get_encoder(H264_CODEC), H264Encoder)
+
+        def nal_types(pts: int) -> set[int]:
+            frame = self.create_video_frame(width=640, height=480, pts=pts)
+            return {p[0] & 0x1F for p in encoder._encode_frame(frame, False)}
+
+        self.assertIn(5, nal_types(0))  # IDR
+
+        # a small raise keeps the codec, so no keyframe
+        encoder.target_bitrate = 1200000
+        self.assertNotIn(5, nal_types(3000))
+
+        # a raise past 30% or a drop past 10% starts a new codec
+        encoder.target_bitrate = 1400000
+        self.assertIn(5, nal_types(6000))
+        encoder.target_bitrate = 1200000
+        self.assertIn(5, nal_types(9000))
+
     def test_frame_encoder(self) -> None:
         encoder = self.ensureIsInstance(get_encoder(H264_CODEC), H264Encoder)
 
