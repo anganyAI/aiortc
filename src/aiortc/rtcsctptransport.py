@@ -25,7 +25,31 @@ logger = logging.getLogger(__name__)
 COOKIE_LENGTH = 24
 COOKIE_LIFETIME = 60
 MAX_STREAMS = 65535
-USERDATA_MAX_LENGTH = 1200
+
+# packet and chunk constants
+SCTP_COMMON_HEADER_LENGTH = 12
+SCTP_CHUNK_HEADER_LENGTH = 4
+SCTP_DATA_CHUNK_HEADER_LENGTH = 16
+# SCTP packet must contain at least one chunk.
+SCTP_PACKET_MINIMUM_LENGTH = SCTP_COMMON_HEADER_LENGTH + SCTP_CHUNK_HEADER_LENGTH
+# The maximum size of an SCTP packet, including the common header, which
+# still fits the minimum IPv6 MTU once UDP and DTLS overhead is subtracted.
+# See https://issues.webrtc.org/issues/42222640
+SCTP_MAX_PACKET_LENGTH = 1189
+# The maximum amount of user data in a DATA chunk. As chunks are padded to
+# a multiple of 4 bytes, round down to stay within the packet size.
+USERDATA_MAX_LENGTH = (
+    (SCTP_MAX_PACKET_LENGTH - SCTP_COMMON_HEADER_LENGTH - SCTP_DATA_CHUNK_HEADER_LENGTH)
+    // 4
+    * 4
+)
+
+# The maximum message size we advertise in our SDP.
+LOCAL_MAX_MESSAGE_SIZE = 262144
+
+# The maximum message size to assume if the remote party does not
+# advertise one, see RFC 8841 - section 6.
+REMOTE_DEFAULT_MAX_MESSAGE_SIZE = 65536
 
 # protocol constants
 SCTP_CAUSE_INVALID_STREAM = 0x0001
@@ -183,7 +207,7 @@ class DataChunk(Chunk):
             self.user_data = b""
 
     def __bytes__(self) -> bytes:
-        length = 16 + len(self.user_data)
+        length = SCTP_DATA_CHUNK_HEADER_LENGTH + len(self.user_data)
         data = (
             pack(
                 "!BBHLHHL",
@@ -397,21 +421,34 @@ CHUNK_TYPES = dict((cls.type, cls) for cls in CHUNK_CLASSES)
 
 def parse_packet(data: bytes) -> tuple[int, int, int, list[Chunk]]:
     length = len(data)
-    if length < 12:
-        raise ValueError("SCTP packet length is less than 12 bytes")
+
+    # Check the packet is long enough to accomodate the common header
+    # and one chunk's header.
+    if length < SCTP_PACKET_MINIMUM_LENGTH:
+        raise ValueError(
+            f"SCTP packet length is less than {SCTP_PACKET_MINIMUM_LENGTH} bytes"
+        )
 
     source_port, destination_port, verification_tag = unpack_from("!HHL", data)
 
-    # verify checksum
+    # Verify the checksum matches.
     checksum = unpack_from("<L", data, 8)[0]
     if checksum != crc32c(data[0:8] + b"\x00\x00\x00\x00" + data[12:]):
         raise ValueError("SCTP packet has invalid checksum")
 
     chunks: list[Chunk] = []
-    pos = 12
-    while pos <= length - 4:
+    pos = SCTP_COMMON_HEADER_LENGTH
+    while pos <= length - SCTP_CHUNK_HEADER_LENGTH:
         chunk_type, chunk_flags, chunk_length = unpack_from("!BBH", data, pos)
-        chunk_body = data[pos + 4 : pos + chunk_length]
+
+        # Check the chunk length:
+        # - It must be at least as long as the chunk header.
+        # - It must not exceed the remaining packet data.
+        if chunk_length < SCTP_CHUNK_HEADER_LENGTH or pos + chunk_length > length:
+            raise ValueError(
+                f"SCTP chunk has an invalid length of {chunk_length} bytes"
+            )
+        chunk_body = data[pos + SCTP_CHUNK_HEADER_LENGTH : pos + chunk_length]
         chunk_cls = CHUNK_TYPES.get(chunk_type)
         if chunk_cls:
             chunks.append(chunk_cls(flags=chunk_flags, body=chunk_body))
@@ -622,6 +659,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self._local_verification_tag = random32()
 
         self._remote_extensions: list[int] = []
+        self._remote_max_message_size = REMOTE_DEFAULT_MAX_MESSAGE_SIZE
         self._remote_partial_reliability = False
         self._remote_port: Optional[int] = None
         self._remote_verification_tag = 0
@@ -682,7 +720,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
 
     @property
     def is_server(self) -> bool:
-        return self.transport.transport.role != "controlling"
+        # RFC 8832 ties SCTP behaviour to the DTLS role, not the ICE role.
+        return self.transport._role == "server"
 
     @property
     def maxChannels(self) -> Optional[int]:
@@ -721,12 +760,14 @@ class RTCSctpTransport(AsyncIOEventEmitter):
 
         :rtype: RTCSctpCapabilities
         """
-        return RTCSctpCapabilities(maxMessageSize=65536)
+        return RTCSctpCapabilities(maxMessageSize=LOCAL_MAX_MESSAGE_SIZE)
 
     def setTransport(self, transport: RTCDtlsTransport) -> None:
         self.__transport = transport
 
-    async def start(self, remoteCaps: RTCSctpCapabilities, remotePort: int) -> None:
+    async def start(
+        self, remoteCaps: Optional[RTCSctpCapabilities], remotePort: int
+    ) -> None:
         """
         Start the transport.
         """
@@ -734,6 +775,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             self.__started = True
             self.__state = "connecting"
             self._remote_port = remotePort
+            if remoteCaps is not None:
+                self._remote_max_message_size = remoteCaps.maxMessageSize
 
             # configure logging
             if logger.isEnabledFor(logging.DEBUG):
@@ -743,15 +786,15 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                 self.__log_debug = lambda msg, *args: logger.debug(prefix + msg, *args)
 
             # initialise local channel ID counter
-            # one side should be using even IDs, the other odd IDs
+            # RFC 8832: the DTLS client uses even IDs, the DTLS server odd IDs
             if self.is_server:
-                self._data_channel_id = 0
-            else:
                 self._data_channel_id = 1
+            else:
+                self._data_channel_id = 0
 
+            # both endpoints initiate the association, see RFC 8841 section 9.3
             self.__transport._register_data_receiver(self)
-            if not self.is_server:
-                await self._init()
+            await self._init()
 
     async def stop(self) -> None:
         """
@@ -966,8 +1009,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                 if cls is not None:
                     await self._receive_reconfig_param(cls.parse(param[1]))
 
-        # server
-        elif isinstance(chunk, InitChunk) and self.is_server:
+        # an INIT may collide with our own, see RFC 9260 section 5.2.1
+        elif isinstance(chunk, InitChunk):
             self._last_received_tsn = tsn_minus_one(chunk.initial_tsn)
             self._reconfig_response_seq = tsn_minus_one(chunk.initial_tsn)
             self._remote_verification_tag = chunk.initiate_tag
@@ -999,7 +1042,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             cookie += hmac.new(self._hmac_key, cookie, "sha1").digest()
             init_ack.params.append((SCTP_STATE_COOKIE, cookie))
             await self._send_chunk(init_ack)
-        elif isinstance(chunk, CookieEchoChunk) and self.is_server:
+        elif isinstance(chunk, CookieEchoChunk):
             # check state cookie MAC
             cookie = chunk.body
             if (
@@ -1019,11 +1062,11 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                 await self._send_chunk(error)
                 return
 
+            self._t1_cancel()
             cookie_ack = CookieAckChunk()
             await self._send_chunk(cookie_ack)
             self._set_state(self.State.ESTABLISHED)
 
-        # client
         elif (
             isinstance(chunk, InitAckChunk)
             and self._association_state == self.State.COOKIE_WAIT
@@ -1816,6 +1859,16 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             pp_id, user_data = WEBRTC_BINARY_EMPTY, b"\x00"
         else:
             pp_id, user_data = WEBRTC_BINARY, data
+
+        # A maximum message size of 0 means the remote party can handle
+        # messages of any size.
+        if self._remote_max_message_size and (
+            len(user_data) > self._remote_max_message_size
+        ):
+            raise ValueError(
+                f"Cannot send message of {len(user_data)} bytes, the remote party "
+                f"only supports messages up to {self._remote_max_message_size} bytes"
+            )
 
         channel._addBufferedAmount(len(user_data))
         self._data_channel_queue.append((channel, pp_id, user_data))

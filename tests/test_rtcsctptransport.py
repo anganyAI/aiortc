@@ -8,9 +8,12 @@ from unittest.mock import MagicMock, patch
 from aiortc.exceptions import InvalidStateError
 from aiortc.rtcdatachannel import RTCDataChannel, RTCDataChannelParameters
 from aiortc.rtcsctptransport import (
+    LOCAL_MAX_MESSAGE_SIZE,
+    REMOTE_DEFAULT_MAX_MESSAGE_SIZE,
     SCTP_DATA_FIRST_FRAG,
     SCTP_DATA_LAST_FRAG,
     SCTP_DATA_UNORDERED,
+    SCTP_MAX_PACKET_LENGTH,
     USERDATA_MAX_LENGTH,
     AbortChunk,
     Chunk,
@@ -53,7 +56,8 @@ T = TypeVar("T")
 async def client_and_server() -> AsyncGenerator[
     tuple[RTCSctpTransport, RTCSctpTransport], None
 ]:
-    async with dummy_dtls_transport_pair() as (client_transport, server_transport):
+    # The controlled side resolves to the DTLS client in auto mode.
+    async with dummy_dtls_transport_pair() as (server_transport, client_transport):
         client = RTCSctpTransport(client_transport)
         server = RTCSctpTransport(server_transport)
         assert client.is_server is False
@@ -72,7 +76,7 @@ async def client_and_server() -> AsyncGenerator[
 
 @contextlib.asynccontextmanager
 async def client_standalone() -> AsyncGenerator[RTCSctpTransport, None]:
-    async with dummy_dtls_transport_pair() as (client_transport, _):
+    async with dummy_dtls_transport_pair() as (_, client_transport):
         client = RTCSctpTransport(client_transport)
         assert client.is_server is False
 
@@ -80,6 +84,10 @@ async def client_standalone() -> AsyncGenerator[RTCSctpTransport, None]:
             yield client
         finally:
             await client.stop()
+
+
+async def noop_init() -> None:
+    pass
 
 
 async def noop_send_chunk(chunk: Chunk) -> None:
@@ -146,7 +154,7 @@ class SctpPacketTest(TestCase):
         data = load("sctp_init.bin")[0:10]
         with self.assertRaises(ValueError) as cm:
             self.roundtrip_packet(data, None)
-        self.assertEqual(str(cm.exception), "SCTP packet length is less than 12 bytes")
+        self.assertEqual(str(cm.exception), "SCTP packet length is less than 16 bytes")
 
     def test_parse_cookie_echo(self) -> None:
         data = load("sctp_cookie_echo.bin")
@@ -181,6 +189,16 @@ class SctpPacketTest(TestCase):
             repr(chunk), "DataChunk(flags=3, tsn=2584679421, stream_id=1, stream_seq=1)"
         )
 
+    def test_serialize_data_max_length(self) -> None:
+        """
+        A DATA chunk carrying the maximum amount of user data must fit
+        within the maximum SCTP packet size.
+        """
+        chunk = DataChunk()
+        chunk.user_data = b"M" * USERDATA_MAX_LENGTH
+        packet = serialize_packet(5000, 5000, 0, chunk)
+        self.assertLessEqual(len(packet), SCTP_MAX_PACKET_LENGTH)
+
     def test_parse_data_padding(self) -> None:
         data = load("sctp_data_padding.bin")
         chunk = self.roundtrip_packet(data, DataChunk)
@@ -194,6 +212,22 @@ class SctpPacketTest(TestCase):
         self.assertEqual(chunk.user_data, b"M")
         self.assertEqual(
             repr(chunk), "DataChunk(flags=3, tsn=2584679421, stream_id=1, stream_seq=1)"
+        )
+
+    def test_parse_data_truncated_chunk_value(self) -> None:
+        data = load("sctp_data_truncated.bin")
+        with self.assertRaises(ValueError) as cm:
+            self.roundtrip_packet(data, None)
+        self.assertEqual(
+            str(cm.exception), "SCTP chunk has an invalid length of 8 bytes"
+        )
+
+    def test_parse_data_zero_length(self) -> None:
+        data = load("sctp_data_zero_length.bin")
+        with self.assertRaises(ValueError) as cm:
+            self.roundtrip_packet(data, None)
+        self.assertEqual(
+            str(cm.exception), "SCTP chunk has an invalid length of 0 bytes"
         )
 
     def test_parse_error(self) -> None:
@@ -307,6 +341,12 @@ class SctpPacketTest(TestCase):
         self.assertEqual(chunk.type, 7)
         self.assertEqual(chunk.flags, 0)
         self.assertEqual(chunk.cumulative_tsn, 2696426712)
+
+    def test_parse_shutdown_ack(self) -> None:
+        data = load("sctp_shutdown_ack.bin")
+        chunk = self.roundtrip_packet(data, ShutdownAckChunk)
+
+        self.assertEqual(chunk.type, 8)
 
 
 class ChunkFactory:
@@ -676,7 +716,50 @@ class RTCSctpTransportTest(TestCase):
             self.assertEqual(client._association_state, RTCSctpTransport.State.CLOSED)
             self.assertEqual(client.state, "closed")
             self.assertEqual(server._association_state, RTCSctpTransport.State.CLOSED)
-            self.assertEqual(server.state, "connecting")
+            self.assertEqual(server.state, "closed")
+
+    @asynctest
+    async def test_connect_one_side_initiates(self) -> None:
+        for initiator in ["client", "server"]:
+            async with client_and_server() as (client, server):
+                if initiator == "client":
+                    server._init = noop_init  # type: ignore
+                else:
+                    client._init = noop_init  # type: ignore
+
+                await server.start(client.getCapabilities(), client.port)
+                await client.start(server.getCapabilities(), server.port)
+
+                await wait_for_outcome(client, server)
+                self.assertEqual(
+                    client._association_state, RTCSctpTransport.State.ESTABLISHED
+                )
+                self.assertEqual(
+                    server._association_state, RTCSctpTransport.State.ESTABLISHED
+                )
+
+    @asynctest
+    async def test_connect_peer_ignores_init(self) -> None:
+        async with client_and_server() as (client, server):
+            real_receive_chunk = client._receive_chunk
+
+            async def mock_receive_chunk(chunk: Chunk) -> None:
+                if not isinstance(chunk, InitChunk):
+                    await real_receive_chunk(chunk)
+
+            client._receive_chunk = mock_receive_chunk  # type: ignore
+
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(server.getCapabilities(), server.port)
+
+            await wait_for_outcome(client, server)
+            self.assertEqual(
+                client._association_state, RTCSctpTransport.State.ESTABLISHED
+            )
+            self.assertEqual(
+                server._association_state, RTCSctpTransport.State.ESTABLISHED
+            )
+            self.assertIsNone(server._t1_handle)
 
     @asynctest
     async def test_connect_lossy_transport(self) -> None:
@@ -829,12 +912,81 @@ class RTCSctpTransportTest(TestCase):
             self.assertEqual(channel.label, "chat")
 
             await asyncio.sleep(0.1)
-            self.assertEqual(channel.id, 1)
+            self.assertEqual(channel.id, 0)
             self.assertEqual(channel.label, "chat")
             self.assertEqual(len(client_channels), 0)
             self.assertEqual(len(server_channels), 1)
-            self.assertEqual(server_channels[0].id, 1)
+            self.assertEqual(server_channels[0].id, 0)
             self.assertEqual(server_channels[0].label, "chat")
+
+    @asynctest
+    async def test_connect_then_send_message_too_large(self) -> None:
+        async with client_and_server() as (client, server):
+            # connect, the server only accepts messages of up to 1000 bytes
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(RTCSctpCapabilities(maxMessageSize=1000), server.port)
+
+            # check outcome
+            await wait_for_outcome(client, server)
+            self.assertEqual(
+                client._association_state, RTCSctpTransport.State.ESTABLISHED
+            )
+
+            # create data channel
+            channel = RTCDataChannel(client, RTCDataChannelParameters(label="chat"))
+            await asyncio.sleep(0.1)
+            self.assertEqual(channel.readyState, "open")
+
+            # a message which fits is accepted
+            channel.send(b"M" * 1000)
+
+            # a larger message is rejected and is not buffered
+            buffered_amount = channel.bufferedAmount
+            with self.assertRaises(ValueError) as cm:
+                channel.send(b"M" * 1001)
+            self.assertEqual(
+                str(cm.exception),
+                "Cannot send message of 1001 bytes, the remote party only supports "
+                "messages up to 1000 bytes",
+            )
+            self.assertEqual(channel.bufferedAmount, buffered_amount)
+
+    @asynctest
+    async def test_connect_then_send_message_unlimited(self) -> None:
+        async with client_and_server() as (client, server):
+            # connect, the server accepts messages of any size
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(RTCSctpCapabilities(maxMessageSize=0), server.port)
+
+            # check outcome
+            await wait_for_outcome(client, server)
+            self.assertEqual(
+                client._association_state, RTCSctpTransport.State.ESTABLISHED
+            )
+
+            # create data channel
+            channel = RTCDataChannel(client, RTCDataChannelParameters(label="chat"))
+            await asyncio.sleep(0.1)
+            self.assertEqual(channel.readyState, "open")
+
+            # a large message is accepted
+            channel.send(b"M" * (2 * LOCAL_MAX_MESSAGE_SIZE))
+
+    @asynctest
+    async def test_connect_without_remote_capabilities(self) -> None:
+        async with client_and_server() as (client, server):
+            # connect, the server did not advertise a maximum message size
+            await server.start(client.getCapabilities(), client.port)
+            await client.start(None, server.port)
+
+            # check outcome
+            await wait_for_outcome(client, server)
+            self.assertEqual(
+                client._association_state, RTCSctpTransport.State.ESTABLISHED
+            )
+            self.assertEqual(
+                client._remote_max_message_size, REMOTE_DEFAULT_MAX_MESSAGE_SIZE
+            )
 
     @asynctest
     async def test_connect_then_client_creates_data_channel_with_custom_id(
@@ -931,13 +1083,13 @@ class RTCSctpTransportTest(TestCase):
             await asyncio.sleep(0.1)
             self.assertEqual(channel.id, 1)
             self.assertEqual(channel.label, "chat")
-            self.assertEqual(channel2.id, 3)
+            self.assertEqual(channel2.id, 0)
             self.assertEqual(channel2.label, "chat")
             self.assertEqual(len(client_channels), 0)
             self.assertEqual(len(server_channels), 2)
             self.assertEqual(server_channels[0].id, 1)
             self.assertEqual(server_channels[0].label, "chat")
-            self.assertEqual(server_channels[1].id, 3)
+            self.assertEqual(server_channels[1].id, 0)
             self.assertEqual(server_channels[1].label, "chat")
 
     @asynctest
@@ -1212,7 +1364,7 @@ class RTCSctpTransportTest(TestCase):
 
             await asyncio.sleep(0.1)
             self.assertEqual(len(client_channels), 1)
-            self.assertEqual(client_channels[0].id, 0)
+            self.assertEqual(client_channels[0].id, 1)
             self.assertEqual(client_channels[0].label, "chat")
             self.assertEqual(len(server_channels), 0)
 
@@ -1290,7 +1442,9 @@ class RTCSctpTransportTest(TestCase):
 
             # check outcome
             await asyncio.sleep(0.1)
-            self.assertEqual(server._association_state, RTCSctpTransport.State.CLOSED)
+            self.assertEqual(
+                server._association_state, RTCSctpTransport.State.COOKIE_WAIT
+            )
 
     @asynctest
     async def test_bad_verification_tag(self) -> None:
@@ -1303,7 +1457,9 @@ class RTCSctpTransportTest(TestCase):
 
             # check outcome
             await asyncio.sleep(0.1)
-            self.assertEqual(server._association_state, RTCSctpTransport.State.CLOSED)
+            self.assertEqual(
+                server._association_state, RTCSctpTransport.State.COOKIE_WAIT
+            )
 
     @asynctest
     async def test_bad_cookie(self) -> None:
@@ -1317,6 +1473,7 @@ class RTCSctpTransportTest(TestCase):
                 return await real_send_chunk(chunk)
 
             client._send_chunk = mock_send_chunk  # type: ignore
+            server._init = noop_init  # type: ignore
 
             await server.start(client.getCapabilities(), client.port)
             await client.start(server.getCapabilities(), server.port)
@@ -1401,6 +1558,7 @@ class RTCSctpTransportTest(TestCase):
 
         async with client_and_server() as (client, server):
             server._get_timestamp = mock_timestamp  # type: ignore
+            server._init = noop_init  # type: ignore
             await server.start(client.getCapabilities(), client.port)
             await client.start(server.getCapabilities(), server.port)
 
@@ -1739,18 +1897,18 @@ class RTCSctpTransportTest(TestCase):
             sent_tsns.append(chunk.tsn)
 
         async with client_standalone() as client:
-            client._cwnd = 4800
+            client._cwnd = 4 * USERDATA_MAX_LENGTH
             client._last_sacked_tsn = 4294967295
             client._local_tsn = 0
-            client._ssthresh = 4800
+            client._ssthresh = 4 * USERDATA_MAX_LENGTH
             client._send_chunk = mock_send_chunk  # type: ignore
 
             # queue 16 chunks, but cwnd only allows 4
             await client._send(123, 456, b"M" * USERDATA_MAX_LENGTH * 16)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 4800)
+            self.assertEqual(client._flight_size, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3])
             self.assertEqual(outstanding_tsns(client), [0, 1, 2, 3])
             self.assertEqual(
@@ -1762,9 +1920,9 @@ class RTCSctpTransportTest(TestCase):
             sack.cumulative_tsn = 1
             await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 6000)
+            self.assertEqual(client._cwnd, 5 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 6000)
+            self.assertEqual(client._flight_size, 5 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6])
             self.assertEqual(outstanding_tsns(client), [2, 3, 4, 5, 6])
             self.assertEqual(queued_tsns(client), [7, 8, 9, 10, 11, 12, 13, 14, 15])
@@ -1774,9 +1932,9 @@ class RTCSctpTransportTest(TestCase):
             sack.cumulative_tsn = 3
             await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 6000)
+            self.assertEqual(client._cwnd, 5 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 6000)
+            self.assertEqual(client._flight_size, 5 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7, 8])
             self.assertEqual(outstanding_tsns(client), [4, 5, 6, 7, 8])
             self.assertEqual(queued_tsns(client), [9, 10, 11, 12, 13, 14, 15])
@@ -1786,9 +1944,9 @@ class RTCSctpTransportTest(TestCase):
             sack.cumulative_tsn = 5
             await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 6000)
+            self.assertEqual(client._cwnd, 5 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 6000)
+            self.assertEqual(client._flight_size, 5 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
             self.assertEqual(outstanding_tsns(client), [6, 7, 8, 9, 10])
             self.assertEqual(queued_tsns(client), [11, 12, 13, 14, 15])
@@ -1798,9 +1956,9 @@ class RTCSctpTransportTest(TestCase):
             sack.cumulative_tsn = 7
             await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 7200)
+            self.assertEqual(client._cwnd, 6 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 7200)
+            self.assertEqual(client._flight_size, 6 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
             self.assertEqual(outstanding_tsns(client), [8, 9, 10, 11, 12, 13])
             self.assertEqual(queued_tsns(client), [14, 15])
@@ -1810,9 +1968,9 @@ class RTCSctpTransportTest(TestCase):
             sack.cumulative_tsn = 9
             await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 7200)
+            self.assertEqual(client._cwnd, 6 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 7200)
+            self.assertEqual(client._flight_size, 6 * USERDATA_MAX_LENGTH)
             self.assertEqual(
                 sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
             )
@@ -1837,9 +1995,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._send(123, 456, b"M" * USERDATA_MAX_LENGTH * 8)
 
-            self.assertEqual(client._cwnd, 3600)
+            self.assertEqual(client._cwnd, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 3600)
+            self.assertEqual(client._flight_size, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2])
             self.assertEqual(outstanding_tsns(client), [0, 1, 2])
             self.assertEqual(queued_tsns(client), [3, 4, 5, 6, 7])
@@ -1850,9 +2008,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 4800)
+            self.assertEqual(client._flight_size, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5])
             self.assertEqual(outstanding_tsns(client), [2, 3, 4, 5])
             self.assertEqual(queued_tsns(client), [6, 7])
@@ -1863,9 +2021,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 6000)
+            self.assertEqual(client._cwnd, 5 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 4800)
+            self.assertEqual(client._flight_size, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7])
             self.assertEqual(outstanding_tsns(client), [4, 5, 6, 7])
             self.assertEqual(queued_tsns(client), [])
@@ -1876,9 +2034,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 6000)
+            self.assertEqual(client._cwnd, 5 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 2400)
+            self.assertEqual(client._flight_size, 2 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7])
             self.assertEqual(outstanding_tsns(client), [6, 7])
             self.assertEqual(queued_tsns(client), [])
@@ -1889,7 +2047,7 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerStopped(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 6000)
+            self.assertEqual(client._cwnd, 5 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
             self.assertEqual(client._flight_size, 0)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7])
@@ -1914,9 +2072,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._send(123, 456, b"M" * USERDATA_MAX_LENGTH * 8)
 
-            self.assertEqual(client._cwnd, 3600)
+            self.assertEqual(client._cwnd, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 3600)
+            self.assertEqual(client._flight_size, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2])
             self.assertEqual(outstanding_tsns(client), [0, 1, 2])
             self.assertEqual(queued_tsns(client), [3, 4, 5, 6, 7])
@@ -1928,9 +2086,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 4800)
+            self.assertEqual(client._flight_size, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5])
             self.assertEqual(outstanding_tsns(client), [1, 2, 3, 4, 5])
             self.assertEqual(queued_tsns(client), [6, 7])
@@ -1941,9 +2099,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 6000)
+            self.assertEqual(client._cwnd, 5 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 4800)
+            self.assertEqual(client._flight_size, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7])
             self.assertEqual(outstanding_tsns(client), [4, 5, 6, 7])
             self.assertEqual(queued_tsns(client), [])
@@ -1954,9 +2112,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 6000)
+            self.assertEqual(client._cwnd, 5 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 2400)
+            self.assertEqual(client._flight_size, 2 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7])
             self.assertEqual(outstanding_tsns(client), [6, 7])
             self.assertEqual(queued_tsns(client), [])
@@ -1967,7 +2125,7 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerStopped(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 6000)
+            self.assertEqual(client._cwnd, 5 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
             self.assertEqual(client._flight_size, 0)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7])
@@ -1992,9 +2150,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._send(123, 456, b"M" * USERDATA_MAX_LENGTH * 8)
 
-            self.assertEqual(client._cwnd, 3600)
+            self.assertEqual(client._cwnd, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 3600)
+            self.assertEqual(client._flight_size, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2])
             self.assertEqual(outstanding_tsns(client), [0, 1, 2])
             self.assertEqual(queued_tsns(client), [3, 4, 5, 6, 7])
@@ -2006,9 +2164,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 4800)
+            self.assertEqual(client._flight_size, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5])
             self.assertEqual(outstanding_tsns(client), [1, 2, 3, 4, 5])
             self.assertEqual(queued_tsns(client), [6, 7])
@@ -2020,9 +2178,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerPreserved(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 4800)
+            self.assertEqual(client._flight_size, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7])
             self.assertEqual(outstanding_tsns(client), [1, 2, 3, 4, 5, 6, 7])
             self.assertEqual(queued_tsns(client), [])
@@ -2034,9 +2192,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, 7)
-            self.assertEqual(client._flight_size, 2400)
+            self.assertEqual(client._flight_size, 2 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7, 1])
             self.assertEqual(outstanding_tsns(client), [1, 2, 3, 4, 5, 6, 7])
             self.assertEqual(queued_tsns(client), [])
@@ -2047,7 +2205,7 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerStopped(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
             self.assertEqual(client._flight_size, 0)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7, 1])
@@ -2072,9 +2230,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._send(123, 456, b"M" * USERDATA_MAX_LENGTH * 8)
 
-            self.assertEqual(client._cwnd, 3600)
+            self.assertEqual(client._cwnd, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 3600)
+            self.assertEqual(client._flight_size, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2])
             self.assertEqual(outstanding_tsns(client), [0, 1, 2])
             self.assertEqual(queued_tsns(client), [3, 4, 5, 6, 7])
@@ -2086,9 +2244,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerPreserved(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 3600)
+            self.assertEqual(client._cwnd, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 3600)
+            self.assertEqual(client._flight_size, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3])
             self.assertEqual(outstanding_tsns(client), [0, 1, 2, 3])
             self.assertEqual(queued_tsns(client), [4, 5, 6, 7])
@@ -2100,9 +2258,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerPreserved(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 3600)
+            self.assertEqual(client._cwnd, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 3600)
+            self.assertEqual(client._flight_size, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4])
             self.assertEqual(outstanding_tsns(client), [0, 1, 2, 3, 4])
             self.assertEqual(queued_tsns(client), [5, 6, 7])
@@ -2114,9 +2272,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, 4)
-            self.assertEqual(client._flight_size, 2400)
+            self.assertEqual(client._flight_size, 2 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 0, 1])
             self.assertEqual(outstanding_tsns(client), [0, 1, 2, 3, 4])
             self.assertEqual(queued_tsns(client), [5, 6, 7])
@@ -2127,9 +2285,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 3600)
+            self.assertEqual(client._flight_size, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 0, 1, 5, 6, 7])
             self.assertEqual(outstanding_tsns(client), [5, 6, 7])
             self.assertEqual(queued_tsns(client), [])
@@ -2140,7 +2298,7 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerStopped(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
             self.assertEqual(client._flight_size, 0)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 0, 1, 5, 6, 7])
@@ -2165,9 +2323,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._send(123, 456, b"M" * USERDATA_MAX_LENGTH * 8)
 
-            self.assertEqual(client._cwnd, 3600)
+            self.assertEqual(client._cwnd, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 3600)
+            self.assertEqual(client._flight_size, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2])
             self.assertEqual(outstanding_tsns(client), [0, 1, 2])
             self.assertEqual(queued_tsns(client), [3, 4, 5, 6, 7])
@@ -2178,9 +2336,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 4800)
+            self.assertEqual(client._flight_size, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5])
             self.assertEqual(outstanding_tsns(client), [2, 3, 4, 5])
             self.assertEqual(queued_tsns(client), [6, 7])
@@ -2192,9 +2350,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerPreserved(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 4800)
+            self.assertEqual(client._flight_size, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6])
             self.assertEqual(outstanding_tsns(client), [2, 3, 4, 5, 6])
             self.assertEqual(queued_tsns(client), [7])
@@ -2206,15 +2364,15 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerPreserved(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 4800)
+            self.assertEqual(client._flight_size, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7])
             self.assertEqual(outstanding_tsns(client), [2, 3, 4, 5, 6, 7])
             self.assertEqual(queued_tsns(client), [])
 
             # artificially raise flight size to hit cwnd
-            client._flight_size += 2400
+            client._flight_size += 2 * USERDATA_MAX_LENGTH
 
             # SACK comes in acknowledging chunk 7
             sack = SackChunk()
@@ -2223,9 +2381,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, 7)
-            self.assertEqual(client._flight_size, 4800)
+            self.assertEqual(client._flight_size, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7, 2, 3])
             self.assertEqual(outstanding_tsns(client), [2, 3, 4, 5, 6, 7])
             self.assertEqual(queued_tsns(client), [])
@@ -2237,9 +2395,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerRestarted(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, 7)
-            self.assertEqual(client._flight_size, 3600)
+            self.assertEqual(client._flight_size, 3 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7, 2, 3, 4])
             self.assertEqual(outstanding_tsns(client), [4, 5, 6, 7])
             self.assertEqual(queued_tsns(client), [])
@@ -2250,9 +2408,9 @@ class RTCSctpTransportTest(TestCase):
             with self.assertTimerStopped(client):
                 await client._receive_chunk(sack)
 
-            self.assertEqual(client._cwnd, 4800)
+            self.assertEqual(client._cwnd, 4 * USERDATA_MAX_LENGTH)
             self.assertEqual(client._fast_recovery_exit, None)
-            self.assertEqual(client._flight_size, 2400)
+            self.assertEqual(client._flight_size, 2 * USERDATA_MAX_LENGTH)
             self.assertEqual(sent_tsns, [0, 1, 2, 3, 4, 5, 6, 7, 2, 3, 4])
             self.assertEqual(outstanding_tsns(client), [])
             self.assertEqual(queued_tsns(client), [])
