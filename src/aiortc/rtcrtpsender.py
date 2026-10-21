@@ -37,6 +37,7 @@ from .rtp import (
     RtcpSourceInfo,
     RtcpSrPacket,
     RtpPacket,
+    unpack_fir_fci,
     unpack_remb_fci,
     wrap_rtx,
 )
@@ -102,6 +103,7 @@ class RTCRtpSender:
         self._stream_id = str(uuid.uuid4())
         self._enabled = True
         self.__encoder: Optional[Encoder] = None
+        self.__fir_seq: dict[int, int] = {}
         self.__force_keyframe = False
         self.__loop = asyncio.get_event_loop()
         self.__mid: Optional[str] = None
@@ -274,10 +276,12 @@ class RTCRtpSender:
         elif isinstance(packet, RtcpRtpfbPacket) and packet.fmt == RTCP_RTPFB_NACK:
             for seq in packet.lost:
                 await self._retransmit(seq)
-        elif isinstance(packet, RtcpPsfbPacket) and packet.fmt in (
-            RTCP_PSFB_FIR,  # Full Instantaneous Resolution
-            RTCP_PSFB_PLI,  # Picture Loss Indication
-        ):
+        elif isinstance(packet, RtcpPsfbPacket) and packet.fmt == RTCP_PSFB_FIR:
+            # Full Intra Request
+            if self._is_new_fir(packet):
+                self._send_keyframe()
+        elif isinstance(packet, RtcpPsfbPacket) and packet.fmt == RTCP_PSFB_PLI:
+            # Picture Loss Indication
             self._send_keyframe()
         elif isinstance(packet, RtcpPsfbPacket) and packet.fmt == RTCP_PSFB_APP:
             try:
@@ -347,6 +351,22 @@ class RTCRtpSender:
             self.__log_debug("> %s", packet)
             packet_bytes = packet.serialize(self.__rtp_header_extensions_map)
             await self.transport._send_rtp(packet_bytes)
+
+    def _is_new_fir(self, packet: RtcpPsfbPacket) -> bool:
+        """
+        Tell whether a FIR asks for a new keyframe.
+
+        A FIR repeated with the same sequence number is a retransmission of
+        a request already answered (RFC 5104 section 4.3.1.2): answering
+        each copy sends a burst of keyframes.
+        """
+        for ssrc, seq in unpack_fir_fci(packet.fci):
+            if ssrc == self._ssrc:
+                if self.__fir_seq.get(packet.ssrc) == seq:
+                    return False
+                self.__fir_seq[packet.ssrc] = seq
+                return True
+        return True
 
     def _send_keyframe(self) -> None:
         """

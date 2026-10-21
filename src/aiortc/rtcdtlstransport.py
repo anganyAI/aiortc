@@ -306,8 +306,7 @@ class RtpRouter:
             # for FIR packets too (RFC 5104): each 8-byte FCI entry starts
             # with the SSRC of the media sender asked for a keyframe
             elif isinstance(packet, RtcpPsfbPacket) and packet.fmt == rtp.RTCP_PSFB_FIR:
-                for pos in range(0, len(packet.fci) - 7, 8):
-                    ssrc = int.from_bytes(packet.fci[pos : pos + 4], "big")
+                for ssrc, _ in rtp.unpack_fir_fci(packet.fci):
                     add_recipient(self.senders.get(ssrc))
 
         return recipients

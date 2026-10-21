@@ -206,6 +206,34 @@ class RTCRtpSenderTest(TestCase):
             await sender.stop()
 
     @asynctest
+    async def test_handle_rtcp_fir_retransmission(self) -> None:
+        async with dummy_dtls_transport_pair() as (local_transport, _):
+            sender = RTCRtpSender(VideoStreamTrack(), local_transport)
+            await sender.send(RTCRtpSendParameters(codecs=[VP8_CODEC]))
+
+            def fir(seq: int) -> RtcpPsfbPacket:
+                # RFC 5104: media SSRC is 0, the FCI names the sender
+                return RtcpPsfbPacket(
+                    fmt=RTCP_PSFB_FIR,
+                    ssrc=1234,
+                    media_ssrc=0,
+                    fci=pack("!LB3x", sender._ssrc, seq),
+                )
+
+            with patch.object(sender, "_send_keyframe") as send_keyframe:
+                # a retransmitted FIR asks for the same keyframe
+                await sender._handle_rtcp_packet(fir(1))
+                await sender._handle_rtcp_packet(fir(1))
+                self.assertEqual(send_keyframe.call_count, 1)
+
+                # a new sequence number is a new request
+                await sender._handle_rtcp_packet(fir(2))
+                self.assertEqual(send_keyframe.call_count, 2)
+
+            # clean shutdown
+            await sender.stop()
+
+    @asynctest
     async def test_handle_rtcp_remb(self) -> None:
         async with dummy_dtls_transport_pair() as (local_transport, _):
             sender = RTCRtpSender(VideoStreamTrack(), local_transport)

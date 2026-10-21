@@ -213,6 +213,18 @@ def unpack_remb_fci(data: bytes) -> tuple[int, list[int]]:
     return (bitrate, ssrcs)
 
 
+def unpack_fir_fci(data: bytes) -> list[tuple[int, int]]:
+    """
+    Unpack the FCI for a Full Intra Request.
+
+    Each 8-byte entry holds the SSRC of the media sender asked for a
+    keyframe and the request's sequence number.
+
+    https://tools.ietf.org/html/rfc5104#section-4.3.1.1
+    """
+    return [unpack_from("!LB", data, pos) for pos in range(0, len(data) - 7, 8)]
+
+
 def is_rtcp(msg: bytes) -> bool:
     return len(msg) >= 2 and msg[1] >= 192 and msg[1] <= 208
 
