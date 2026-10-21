@@ -1055,7 +1055,14 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             oldTransports = set()
             slaveMids = bundle.items[1:]
             for transceiver in self.__transceivers:
-                if transceiver.mid in slaveMids and not transceiver._bundled:
+                # By transport, not by the _bundled flag: with the balanced
+                # policy a transceiver created for a remote m-section takes
+                # another one's transport, as yet unbundled, and is flagged
+                # bundled already; it would stay on that discarded transport.
+                if (
+                    transceiver.mid in slaveMids
+                    and transceiver.receiver.transport is not primaryTransport
+                ):
                     oldTransports.add(transceiver.receiver.transport)
                     transceiver.receiver.setTransport(primaryTransport)
                     transceiver.sender.setTransport(primaryTransport)

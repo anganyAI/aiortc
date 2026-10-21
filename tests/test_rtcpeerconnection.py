@@ -5412,6 +5412,28 @@ a=rtpmap:0 PCMU/8000
         )
 
     @asynctest
+    async def test_bundle_transceiver_created_for_a_remote_section(self) -> None:
+        # The answerer has one video track; the offer has two video
+        # m-sections, so the second one gets a new transceiver.
+        pc1 = RTCPeerConnection()
+        pc1.addTransceiver("audio")
+        pc1.addTransceiver("video")
+        pc1.addTransceiver("video", direction="sendonly")
+        await pc1.setLocalDescription(await pc1.createOffer())
+
+        pc2 = RTCPeerConnection()
+        pc2.addTrack(AudioStreamTrack())
+        pc2.addTrack(VideoStreamTrack())
+        await pc2.setRemoteDescription(pc1.localDescription)
+
+        transports = {id(t.receiver.transport) for t in pc2.getTransceivers()}
+        self.assertEqual(len(pc2.getTransceivers()), 3)
+        self.assertEqual(len(transports), 1)
+
+        await pc1.close()
+        await pc2.close()
+
+    @asynctest
     async def test_bundlepolicy_transports_max_compat(self) -> None:
         pc = RTCPeerConnection(
             RTCConfiguration(bundlePolicy=RTCBundlePolicy.MAX_COMPAT)
