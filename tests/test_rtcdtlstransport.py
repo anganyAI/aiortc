@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import struct
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +20,7 @@ from aiortc.rtcrtpparameters import (
 )
 from aiortc.rtp import (
     RTCP_PSFB_APP,
+    RTCP_PSFB_FIR,
     RTCP_PSFB_PLI,
     RTCP_RTPFB_NACK,
     AnyRtcpPacket,
@@ -525,6 +527,15 @@ class RtpRouterTest(TestCase):
 
         # PSFB - PLI
         packet = RtcpPsfbPacket(fmt=RTCP_PSFB_PLI, ssrc=1234, media_ssrc=3456)
+        self.assertEqual(router.route_rtcp(packet), set([sender]))
+
+        # PSFB - FIR: media SSRC is 0 (RFC 5104), the target is in the FCI
+        packet = RtcpPsfbPacket(
+            fmt=RTCP_PSFB_FIR,
+            ssrc=1234,
+            media_ssrc=0,
+            fci=struct.pack("!LB3x", 3456, 1),
+        )
         self.assertEqual(router.route_rtcp(packet), set([sender]))
 
         # PSFB - REMB
