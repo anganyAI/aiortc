@@ -71,6 +71,7 @@ class DummyIceTransport:
     def __init__(self, connection: DummyConnection, role: str) -> None:
         self._connection = connection
         self.role = role
+        self.state = "completed"
 
     async def stop(self) -> None:
         await self._connection.close()
