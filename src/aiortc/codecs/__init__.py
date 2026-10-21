@@ -9,6 +9,7 @@ from ..rtcrtpparameters import (
     RTCRtpHeaderExtensionCapability,
     RTCRtpHeaderExtensionParameters,
 )
+from .av1 import Av1Decoder, Av1Encoder, av1_depayload
 from .base import Decoder, Encoder
 from .g711 import PcmaDecoder, PcmaEncoder, PcmuDecoder, PcmuEncoder
 from .g722 import G722Decoder, G722Encoder
@@ -102,6 +103,7 @@ def init_codecs() -> None:
                 "profile-level-id": profile_level_id,
             },
         )
+    add_video_codec("video/AV1")
 
 
 def depayload(codec: RTCRtpCodecParameters, payload: bytes) -> bytes:
@@ -109,6 +111,8 @@ def depayload(codec: RTCRtpCodecParameters, payload: bytes) -> bytes:
         return vp8_depayload(payload)
     elif codec.name == "H264":
         return h264_depayload(payload)
+    elif codec.name == "AV1":
+        return av1_depayload(payload)
     else:
         return payload
 
@@ -156,6 +160,8 @@ def get_decoder(codec: RTCRtpCodecParameters) -> Decoder:
         return PcmaDecoder()
     elif mimeType == "audio/pcmu":
         return PcmuDecoder()
+    elif mimeType == "video/av1":
+        return Av1Decoder()
     elif mimeType == "video/h264":
         return H264Decoder()
     elif mimeType == "video/vp8":
@@ -175,6 +181,8 @@ def get_encoder(codec: RTCRtpCodecParameters) -> Encoder:
         return PcmaEncoder()
     elif mimeType == "audio/pcmu":
         return PcmuEncoder()
+    elif mimeType == "video/av1":
+        return Av1Encoder()
     elif mimeType == "video/h264":
         return H264Encoder()
     elif mimeType == "video/vp8":
