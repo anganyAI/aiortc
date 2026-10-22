@@ -126,6 +126,10 @@ class RTCRtpSender:
         self.__lsr_time: Optional[float] = None
         self.__ntp_timestamp = 0
         self.__rtp_timestamp = 0
+        # When the last RTP packet left, and its codec's clock rate: a sender
+        # report's RTP timestamp is extrapolated from them to the report's time
+        self.__rtp_sent_at: Optional[float] = None
+        self.__clock_rate = 0
         self.__octet_count = 0
         self.__packet_count = 0
         self.__rtt: Optional[float] = None
@@ -242,6 +246,15 @@ class RTCRtpSender:
             self.__rtp_task.cancel()
             self.__rtcp_task.cancel()
             await asyncio.gather(self.__rtp_exited.wait(), self.__rtcp_exited.wait())
+
+    def __sender_report_time(self) -> tuple[int, int]:
+        """The NTP time now, and the RTP timestamp of that instant."""
+        now = time.time()
+        rtp_timestamp = self.__rtp_timestamp
+        if self.__rtp_sent_at is not None and self.__clock_rate:
+            elapsed = round((now - self.__rtp_sent_at) * self.__clock_rate)
+            rtp_timestamp = uint32_add(rtp_timestamp, elapsed)
+        return clock.current_ntp_time(), rtp_timestamp
 
     async def _handle_rtcp_packet(self, packet: AnyRtcpPacket) -> None:
         if isinstance(packet, (RtcpRrPacket, RtcpSrPacket)):
@@ -420,8 +433,9 @@ class RTCRtpSender:
                     packet_bytes = packet.serialize(self.__rtp_header_extensions_map)
                     await self.transport._send_rtp(packet_bytes)
 
-                    self.__ntp_timestamp = clock.current_ntp_time()
                     self.__rtp_timestamp = packet.timestamp
+                    self.__rtp_sent_at = time.time()
+                    self.__clock_rate = codec.clockRate
                     self.__octet_count += len(payload)
                     self.__packet_count += 1
                     sequence_number = uint16_add(sequence_number, 1)
@@ -453,7 +467,11 @@ class RTCRtpSender:
                 # range [0.5, 1.5] times the calculated interval.
                 await asyncio.sleep(0.5 + random.random())
 
-                # RTCP SR
+                # RTCP SR, stamped with the time it is sent (RFC 3550 §6.4.1):
+                # each report is then told apart from the previous one by its
+                # NTP timestamp, and a receiver's LSR/DLSR names it alone, even
+                # when no RTP left in between (a paused source)
+                self.__ntp_timestamp, self.__rtp_timestamp = self.__sender_report_time()
                 packets: list[AnyRtcpPacket] = [
                     RtcpSrPacket(
                         ssrc=self._ssrc,

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from struct import pack
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
@@ -295,6 +296,55 @@ class RTCRtpSenderTest(TestCase):
 
             # clean shutdown
             await sender.stop()
+
+    @asynctest
+    async def test_sender_report_is_stamped_when_sent(self) -> None:
+        """RFC 3550 §6.4.1: two reports with no RTP in between are told apart,
+        and the RTP timestamp follows the clock from the last packet."""
+        async with dummy_dtls_transport_pair() as (local_transport, _):
+            sender = RTCRtpSender(AudioStreamTrack(), local_transport)
+            sender._RTCRtpSender__rtp_timestamp = 1000
+            sender._RTCRtpSender__rtp_sent_at = time.time() - 0.5
+            sender._RTCRtpSender__clock_rate = 48000
+
+            first_ntp, rtp_timestamp = sender._RTCRtpSender__sender_report_time()
+            await asyncio.sleep(0.01)
+            second_ntp, _ = sender._RTCRtpSender__sender_report_time()
+
+            self.assertNotEqual(first_ntp >> 16, second_ntp >> 16)
+            self.assertAlmostEqual(rtp_timestamp, 1000 + 24000, delta=480)
+
+    @asynctest
+    async def test_round_trip_time_on_a_paused_stream(self) -> None:
+        """The report a receiver names is the one sent last, at its own time:
+        no RTP left since the previous one, the round trip stays positive."""
+        async with dummy_dtls_transport_pair() as (local_transport, _):
+            sender = RTCRtpSender(AudioStreamTrack(), local_transport)
+            ntp, _ = sender._RTCRtpSender__sender_report_time()
+            sender._RTCRtpSender__lsr = (ntp >> 16) & 0xFFFFFFFF
+            sender._RTCRtpSender__lsr_time = time.time() - 0.2
+            await sender._handle_rtcp_packet(
+                RtcpRrPacket(
+                    ssrc=1234,
+                    reports=[
+                        RtcpReceiverInfo(
+                            ssrc=sender._ssrc,
+                            fraction_lost=0,
+                            packets_lost=0,
+                            highest_sequence=630,
+                            jitter=0,
+                            lsr=sender._RTCRtpSender__lsr,
+                            dlsr=int(0.15 * 65536),
+                        )
+                    ],
+                )
+            )
+            remote = next(
+                s
+                for s in (await sender.getStats()).values()
+                if s.type == "remote-inbound-rtp"
+            )
+            self.assertAlmostEqual(remote.roundTripTime, 0.05, delta=0.02)
 
     @patch("aiortc.rtcrtpsender.logger.isEnabledFor")
     @asynctest
