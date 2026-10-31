@@ -25,7 +25,9 @@ classifiers = [
     "Programming Language :: Python :: 3.15",
 ]
 dependencies = [
-    "aioice>=0.10.2,<1.0.0",
+    # The aioice fork, by its release tag: pip installs it too, which ignores
+    # [tool.uv.sources].
+    "aioice @ git+https://github.com/anganyAI/aioice@0.10.2+angany.2",
     "av>=14.0.0,<20.0.0",
     "cryptography>=44.0.0",
     "google-crc32c>=1.1",
@@ -83,5 +85,3 @@ version = {attr = "aiortc.__version__"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.uv.sources]
-aioice = { git = "https://github.com/anganyAI/aioice", tag = "0.10.2+angany.2" }
