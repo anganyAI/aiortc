@@ -62,6 +62,10 @@ strict_optional = false
 warn_redundant_casts = true
 warn_unused_ignores = true
 
+[tool.check-manifest]
+# The fork's development lock, which the sdist does not ship.
+ignore = ["uv.lock"]
+
 [tool.ruff.lint]
 select = [
     "E",  # pycodestyle

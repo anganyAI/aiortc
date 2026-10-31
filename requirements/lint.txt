@@ -1,3 +1,6 @@
 check-manifest
 mypy
 ruff
+# PyAV 19 types a time base as AVRational, which aiortc's typing does not
+# accept yet; the code runs on 19. Drop this once the upstream typing does.
+av<19
