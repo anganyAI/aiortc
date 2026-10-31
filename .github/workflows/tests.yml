@@ -76,9 +76,3 @@ jobs:
         run: pip install build wheel
       - name: Build package
         run: python -m build
-      - name: Publish to PyPI
-        if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags/')
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          user: __token__
-          password: ${{ secrets.PYPI_TOKEN }}
