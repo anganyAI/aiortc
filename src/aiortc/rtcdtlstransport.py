@@ -522,7 +522,9 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
 
         logger.info(
             "RTCDtlsTransport(%s) DTLS start: role=%s, ice_state=%s, fingerprints=%d",
-            id(self), self._role, self.transport.state,
+            id(self),
+            self._role,
+            self.transport.state,
             len(remoteParameters.fingerprints),
         )
 
@@ -849,7 +851,9 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         if data:
             logger.info(
                 "RTCDtlsTransport(%s) DTLS sending %d bytes (first_byte=0x%02x)",
-                self._role, len(data), data[0],
+                self._role,
+                len(data),
+                data[0],
             )
             await self.transport._send(data)
             self.__tx_bytes += len(data)

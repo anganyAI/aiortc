@@ -1124,7 +1124,10 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             has_remote = transceiver in self.__remoteIce
             logger.info(
                 "__connect: candidates=%s, remote_ice=%s, dtls_state=%s, dtls_role=%s",
-                has_candidates, has_remote, dtlsTransport.state, dtlsTransport._role,
+                has_candidates,
+                has_remote,
+                dtlsTransport.state,
+                dtlsTransport._role,
             )
             if has_candidates and has_remote:
                 # Bundled transceivers share one ICE/DTLS transport. Start it
@@ -1143,7 +1146,8 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                     ice_restarted = getattr(iceTransport, "_ice_restarted", False)
                     logger.info(
                         "__connect: ice done, ice_restarted=%s, dtls_state=%s",
-                        ice_restarted, dtlsTransport.state,
+                        ice_restarted,
+                        dtlsTransport.state,
                     )
                     if ice_restarted:
                         # ICE restart: clear flag but do NOT restart DTLS.
