@@ -115,8 +115,8 @@ wheels = [
 
 [[package]]
 name = "aioice"
-version = "0.10.2+angany.1"
-source = { git = "https://github.com/anganyAI/aioice?tag=0.10.2%2Bangany.1#cc446fee67aac0f149aaa8036731ffbe623d0cb2" }
+version = "0.10.2+angany.2"
+source = { git = "https://github.com/anganyAI/aioice?tag=0.10.2%2Bangany.2#d58daa73ad834a7ff3da301f27e652dc08d18a50" }
 dependencies = [
     { name = "dnspython" },
     { name = "ifaddr" },
@@ -145,7 +145,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", marker = "extra == 'dev'", specifier = ">=3.7.0" },
-    { name = "aioice", git = "https://github.com/anganyAI/aioice?tag=0.10.2%2Bangany.1" },
+    { name = "aioice", git = "https://github.com/anganyAI/aioice?tag=0.10.2%2Bangany.2" },
     { name = "av", specifier = ">=14.0.0,<20.0.0" },
     { name = "coverage", extras = ["toml"], marker = "extra == 'dev'", specifier = ">=7.2.2" },
     { name = "cryptography", specifier = ">=44.0.0" },

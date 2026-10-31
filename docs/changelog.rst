@@ -3,6 +3,12 @@ Changelog
 
 .. currentmodule:: aiortc
 
+1.15.0+angany.2
+---------------
+
+ * Require the aioice fork's 0.10.2+angany.2, which tells an ICE-lite peer which
+   pair is nominated.
+
 1.15.0+angany.1
 ---------------
 
