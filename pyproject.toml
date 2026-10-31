@@ -80,4 +80,4 @@ version = {attr = "aiortc.__version__"}
 where = ["src"]
 
 [tool.uv.sources]
-aioice = { path = "../aioice", editable = true }
+aioice = { git = "https://github.com/anganyAI/aioice", tag = "0.10.2+angany.1" }

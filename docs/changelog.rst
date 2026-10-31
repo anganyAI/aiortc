@@ -3,6 +3,30 @@ Changelog
 
 .. currentmodule:: aiortc
 
+1.15.0+angany.1
+---------------
+
+The anganyAI fork, on top of 1.15.0 and the upstream changes since: what a
+peer connection needs to hold a call with a server that renegotiates, restarts
+ICE and expects its own RTP habits. It requires the aioice fork's
+0.10.2+angany.1.
+
+ * Restart ICE and DTLS on a renegotiation that changes the ICE credentials,
+   and suspend / resume a DTLS session a server reuses across the restart.
+ * Add :attr:`RTCConfiguration.iceTransportPolicy` for relay-only ICE.
+ * Separate ICE gathering from the transports' start (`startTransports()`), and
+   start each bundled ICE/DTLS transport once.
+ * Bundle a transceiver created for a remote m-section on the primary transport.
+ * Default to `actpass` when `a=setup` is missing and to `sendrecv` when the
+   direction is missing; accept trailing bytes in RTCP RR/SR packets.
+ * Route an RTCP FIR to the sender named in its FCI, and answer each FIR
+   sequence number with one keyframe.
+ * Keep H264 RTP payloads under 1100 bytes, and recreate the H264 encoder for a
+   bitrate rise only past 30%.
+ * Add the AV1 video codec.
+ * Stamp each sender report with the time it is sent.
+ * Track the CSRCs of received RTP packets.
+
 1.15.0
 ------
 
