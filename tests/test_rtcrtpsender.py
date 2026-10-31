@@ -303,13 +303,13 @@ class RTCRtpSenderTest(TestCase):
         and the RTP timestamp follows the clock from the last packet."""
         async with dummy_dtls_transport_pair() as (local_transport, _):
             sender = RTCRtpSender(AudioStreamTrack(), local_transport)
-            sender._RTCRtpSender__rtp_timestamp = 1000
-            sender._RTCRtpSender__rtp_sent_at = time.time() - 0.5
-            sender._RTCRtpSender__clock_rate = 48000
+            sender._RTCRtpSender__rtp_timestamp = 1000  # type: ignore[attr-defined]
+            sender._RTCRtpSender__rtp_sent_at = time.time() - 0.5  # type: ignore[attr-defined]
+            sender._RTCRtpSender__clock_rate = 48000  # type: ignore[attr-defined]
 
-            first_ntp, rtp_timestamp = sender._RTCRtpSender__sender_report_time()
+            first_ntp, rtp_timestamp = sender._RTCRtpSender__sender_report_time()  # type: ignore[attr-defined]
             await asyncio.sleep(0.01)
-            second_ntp, _ = sender._RTCRtpSender__sender_report_time()
+            second_ntp, _ = sender._RTCRtpSender__sender_report_time()  # type: ignore[attr-defined]
 
             self.assertNotEqual(first_ntp >> 16, second_ntp >> 16)
             self.assertAlmostEqual(rtp_timestamp, 1000 + 24000, delta=480)
@@ -320,9 +320,9 @@ class RTCRtpSenderTest(TestCase):
         no RTP left since the previous one, the round trip stays positive."""
         async with dummy_dtls_transport_pair() as (local_transport, _):
             sender = RTCRtpSender(AudioStreamTrack(), local_transport)
-            ntp, _ = sender._RTCRtpSender__sender_report_time()
-            sender._RTCRtpSender__lsr = (ntp >> 16) & 0xFFFFFFFF
-            sender._RTCRtpSender__lsr_time = time.time() - 0.2
+            ntp, _ = sender._RTCRtpSender__sender_report_time()  # type: ignore[attr-defined]
+            sender._RTCRtpSender__lsr = (ntp >> 16) & 0xFFFFFFFF  # type: ignore[attr-defined]
+            sender._RTCRtpSender__lsr_time = time.time() - 0.2  # type: ignore[attr-defined]
             await sender._handle_rtcp_packet(
                 RtcpRrPacket(
                     ssrc=1234,
@@ -333,7 +333,7 @@ class RTCRtpSenderTest(TestCase):
                             packets_lost=0,
                             highest_sequence=630,
                             jitter=0,
-                            lsr=sender._RTCRtpSender__lsr,
+                            lsr=sender._RTCRtpSender__lsr,  # type: ignore[attr-defined]
                             dlsr=int(0.15 * 65536),
                         )
                     ],

@@ -232,7 +232,7 @@ def packetize(data: bytes, new_sequence: bool = False) -> list[bytes]:
 
 class Av1Decoder(Decoder):
     def __init__(self) -> None:
-        self.codec = av.CodecContext.create("libdav1d", "r")
+        self.codec = cast(VideoCodecContext, av.CodecContext.create("libdav1d", "r"))
         # dav1d holds back several frames by default; return each at once
         self.codec.options = {"max_frame_delay": "1"}
 
